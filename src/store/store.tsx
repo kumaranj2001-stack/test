@@ -1,0 +1,1374 @@
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  collection,
+  deleteDoc,
+  deleteField,
+  doc,
+  getDoc,
+  onSnapshot,
+  setDoc,
+  writeBatch,
+} from "firebase/firestore";
+import { db } from "../firebase";
+import { flashToast } from "../utils/helpers";
+import type { AppData, AuditLog, Branch, Doctor, FeatureFlags, GRN, Invoice, Medicine, Patient, PaymentSettings, ReturnEntry, StaffPlanLimits, StaffPlanTier, Supplier, User } from "./types";
+import { DEFAULT_CUSTOM_STAFF_LIMITS, DEFAULT_FEATURE_FLAGS, DEFAULT_STAFF_PLAN, isStaffPlanTier, planAllowsMultiBranch, getAuditRetentionMs } from "./types";
+
+const DATA_KEY = "guru_pharma_data_v3";
+const SESSION_KEY = "guru_pharma_session_v3";
+const BRANCH_SESSION_KEY = "guru_pharma_session_branch_v3";
+
+const COLLECTIONS = {
+  branches: "gp_branches",
+  users: "gp_users",
+  medicines: "gp_medicines",
+  patients: "gp_patients",
+  doctors: "gp_doctors",
+  invoices: "gp_invoices",
+  suppliers: "gp_suppliers",
+  grns: "gp_grns",
+  returns: "gp_returns",
+  audit: "gp_audit",
+  meta: "gp_meta",
+} as const;
+
+/* Single branch pharmacy setup: All operations run under the primary store branch */
+const starterBranch: Branch = {
+  id: "br_main",
+  name: "Main Pharmacy",
+  code: "MAIN",
+  storeName: "Guru Pharmacy",
+  address: "",
+  phone: "",
+  active: true,
+  createdAt: new Date().toISOString(),
+};
+
+const defaultUsers: User[] = [
+  {
+    id: "u_developer",
+    username: "guru",
+    password: "kumaran",
+    name: "Developer",
+    role: "developer",
+    active: true,
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: "u_super",
+    username: "super",
+    password: "admin",
+    name: "Super Admin",
+    role: "superadmin",
+    active: true,
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: "u_admin",
+    username: "kumaran",
+    password: "kumaranjkms",
+    name: "Kumaran (Admin)",
+    role: "admin",
+    branchId: "br_main",
+    active: true,
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: "u_staff",
+    username: "staff123",
+    password: "kumaranjk",
+    name: "Pharmacy Staff",
+    role: "staff",
+    branchId: "br_main",
+    active: true,
+    createdAt: new Date().toISOString(),
+  },
+];
+
+const defaultDoctors: Doctor[] = [
+  {
+    id: "doc_1",
+    name: "Dr. Arvind Sharma",
+    hospital: "Apollo Multispecialty Hospital",
+    hospitalAddress: "Plot 14, Health City, Main Road",
+    phone: "9876543210",
+    regNo: "MCI-48291",
+    branchId: "br_main",
+    createdAt: new Date().toISOString(),
+  },
+  {
+    id: "doc_2",
+    name: "Dr. Priya Nair",
+    hospital: "Fortis City Clinic",
+    hospitalAddress: "Sector 5, Medical Enclave",
+    phone: "9811223344",
+    regNo: "MCI-73910",
+    branchId: "br_main",
+    createdAt: new Date().toISOString(),
+  },
+];
+
+/* Clean start: one branch, the four role accounts, zero business data */
+const seedData = (): AppData => ({
+  branches: [starterBranch],
+  users: defaultUsers,
+  medicines: [],
+  patients: [],
+  doctors: defaultDoctors,
+  invoices: [],
+  suppliers: [],
+  grns: [],
+  returns: [],
+  audit: [],
+  counters: { invoice: 1000, grn: 500 },
+});
+
+type EntityKey = "branches" | "users" | "medicines" | "patients" | "doctors" | "invoices" | "suppliers" | "grns" | "returns" | "audit";
+
+const ENTITY_KEYS: EntityKey[] = ["branches", "users", "medicines", "patients", "doctors", "invoices", "suppliers", "grns", "returns", "audit"];
+
+type FirestoreSlices = Record<EntityKey, unknown[]>;
+
+function getLocalData(): AppData | null {
+  try {
+    const raw = localStorage.getItem(DATA_KEY);
+    if (raw) return JSON.parse(raw) as AppData;
+  } catch {}
+  return null;
+}
+
+function saveLocalData(data: AppData) {
+  localStorage.setItem(DATA_KEY, JSON.stringify(data));
+}
+
+function ensureDefaults(data: AppData): AppData {
+  const next: AppData = {
+    ...seedData(),
+    ...data,
+    branches: [...(data.branches || [])],
+    users: [...(data.users || [])],
+    medicines: [...(data.medicines || [])],
+    patients: [...(data.patients || [])],
+    doctors: [...(data.doctors || defaultDoctors)].map((d) => (d.branchId ? d : { ...d, branchId: starterBranch.id })),
+    invoices: [...(data.invoices || [])],
+    suppliers: [...(data.suppliers || [])],
+    grns: [...(data.grns || [])],
+    returns: [...(data.returns || [])],
+    audit: [...(data.audit || [])],
+    counters: data.counters || { invoice: 1000, grn: 500 },
+  };
+
+  if (!next.branches.find((b) => b.id === starterBranch.id)) next.branches.unshift(starterBranch);
+
+  if (!next.users || next.users.length === 0) {
+    next.users = [...defaultUsers];
+  } else {
+    // Preserve at least one developer account so developer access is never permanently locked out
+    const hasDeveloper = next.users.some((u) => u.role === "developer" || u.username === "guru");
+    if (!hasDeveloper) {
+      const devAccount = defaultUsers.find((u) => u.role === "developer") || {
+        id: "u_developer",
+        name: "Developer",
+        username: "guru",
+        password: "dev",
+        role: "developer" as const,
+        active: true,
+        createdAt: new Date().toISOString(),
+      };
+      next.users.unshift(devAccount);
+    }
+  }
+
+  // Developer guru role safeguard (preserves developer privileges while respecting custom name & password edits)
+  const guru = next.users.find((u) => u.username === "guru");
+  if (guru && guru.role !== "developer") {
+    guru.role = "developer";
+  }
+  return next;
+}
+
+const DATA_PURGED_MARKER = "gp_purged_data_v3_20261028";
+
+function initialData(): AppData {
+  const local = getLocalData();
+  const wasPurged = typeof window !== "undefined" && localStorage.getItem(DATA_PURGED_MARKER);
+  if (!wasPurged && typeof window !== "undefined") {
+    try {
+      localStorage.setItem(DATA_PURGED_MARKER, new Date().toISOString());
+      const clean = seedData();
+      if (local) {
+        clean.branches = local.branches && local.branches.length > 0 ? local.branches : clean.branches;
+        clean.users = local.users && local.users.length > 0 ? local.users : clean.users;
+        clean.patients = local.patients || [];
+        clean.doctors = local.doctors && local.doctors.length > 0 ? local.doctors : clean.doctors;
+        clean.suppliers = local.suppliers || [];
+      }
+      clean.medicines = [];
+      clean.invoices = [];
+      clean.audit = [];
+      clean.grns = [];
+      clean.returns = [];
+      clean.counters = { invoice: 1000, grn: 500 };
+      saveLocalData(clean);
+      return ensureDefaults(clean);
+    } catch {}
+  }
+  return ensureDefaults(local || seedData());
+}
+
+/* ── Single branch data architecture ───────────────────────────────────────
+   In a single branch pharmacy suite, all operational data belongs to the
+   pharmacy. Records are stamped with the primary branch ID ("br_main")
+   for data consistency across all devices and cloud collections.           */
+
+const SCOPED_KEYS = ["medicines", "patients", "doctors", "invoices", "suppliers", "grns", "returns", "audit"] as const;
+type ScopedKey = (typeof SCOPED_KEYS)[number];
+
+function scopeBranchOf(_user: User | null, _viewBranchId: string | null): string {
+  return "br_main";
+}
+
+function scopeData(full: AppData, _branchId: string | null): AppData {
+  return full;
+}
+
+function mergeScoped(_full: AppData, scopedNext: AppData, _branchId: string | null): AppData {
+  const next = { ...scopedNext };
+  for (const key of SCOPED_KEYS) {
+    (next as unknown as Record<ScopedKey, unknown[]>)[key] = (
+      scopedNext[key] as Array<{ id: string; branchId?: string }>
+    ).map((r) => (r && !r.branchId ? { ...r, branchId: "br_main" } : r));
+  }
+  return next;
+}
+
+export interface BranchBackupFile {
+  kind: "guru-branch";
+  version: 1;
+  branchId: string;
+  exportedAt: string;
+  data: AppData;
+  payment?: PaymentSettings;
+  profile?: import("./types").StoreProfile;
+}
+
+export function parseBranchBackup(raw: unknown): { data: AppData; branchId?: string; payment?: PaymentSettings; profile?: import("./types").StoreProfile } {
+  if (!raw || typeof raw !== "object") throw new Error("Invalid file");
+  const obj = raw as Record<string, unknown>;
+  if ((obj.kind === "guru-branch" || obj.kind === "curavite-branch") && obj.data && typeof obj.data === "object") {
+    const data = obj.data as AppData;
+    if (!Array.isArray(data.medicines)) throw new Error("Invalid file");
+    return {
+      data,
+      branchId: typeof obj.branchId === "string" ? obj.branchId : undefined,
+      payment: obj.payment as PaymentSettings | undefined,
+      profile: obj.profile as import("./types").StoreProfile | undefined,
+    };
+  }
+  const data = raw as AppData;
+  if (!Array.isArray(data.medicines) && !Array.isArray(data.invoices)) throw new Error("Invalid file");
+  return { data };
+}
+
+function removeUndefined<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((item) => removeUndefined(item)) as T;
+  if (value && typeof value === "object") {
+    const next: Record<string, unknown> = {};
+    Object.entries(value as Record<string, unknown>).forEach(([key, val]) => {
+      if (val !== undefined) next[key] = removeUndefined(val);
+    });
+    return next as T;
+  }
+  return value;
+}
+
+function stableStringify(value: unknown) {
+  return JSON.stringify(removeUndefined(value));
+}
+
+function friendlyCloudError(err: unknown): string {
+  const code = (err as { code?: string })?.code || "";
+  if (code === "permission-denied") {
+    return "Firestore rules are blocking access. Open Firebase Console → Firestore Database → Rules, paste the rules shown in Settings → Cloud Backend, then publish.";
+  }
+  if (code === "failed-precondition" || code === "not-found") {
+    return "Firestore database is not created yet. Open Firebase Console → Firestore Database and click Create database.";
+  }
+  if (code === "unavailable") {
+    return "No internet connection. Changes are saved locally and will sync when you are back online.";
+  }
+  return err instanceof Error ? err.message : "Cloud connection failed.";
+}
+
+function sortByDateDesc<T extends { date?: string; createdAt?: string; timestamp?: string }>(items: T[]) {
+  return [...items].sort((a, b) => {
+    const av = a.timestamp || a.date || a.createdAt || "";
+    const bv = b.timestamp || b.date || b.createdAt || "";
+    return bv.localeCompare(av);
+  });
+}
+
+export interface CloudCutoffs {
+  auditClearedAt?: string | null;
+  invoicesClearedAt?: string | null;
+  medicinesClearedAt?: string | null;
+  grnsClearedAt?: string | null;
+  returnsClearedAt?: string | null;
+}
+
+function normalizeCloudData(
+  slices: Partial<FirestoreSlices>,
+  counters: AppData["counters"] | null,
+  cutoffs?: CloudCutoffs
+): AppData {
+  const allAudit = sortByDateDesc((slices.audit || []) as AuditLog[]);
+  const audit = cutoffs?.auditClearedAt
+    ? allAudit.filter((a) => a.timestamp > cutoffs.auditClearedAt!)
+    : allAudit;
+
+  const allInvoices = sortByDateDesc((slices.invoices || []) as Invoice[]);
+  const invoices = cutoffs?.invoicesClearedAt
+    ? allInvoices.filter((i) => i.date > cutoffs.invoicesClearedAt!)
+    : allInvoices;
+
+  const allMedicines = [...((slices.medicines || []) as Medicine[])].sort((a, b) => a.name.localeCompare(b.name));
+  const medicines = cutoffs?.medicinesClearedAt
+    ? allMedicines.filter((m) => Boolean(m.createdAt && m.createdAt > cutoffs.medicinesClearedAt!))
+    : allMedicines;
+
+  const allGrns = sortByDateDesc((slices.grns || []) as GRN[]);
+  const grns = cutoffs?.grnsClearedAt
+    ? allGrns.filter((g) => Boolean(g.date && g.date > cutoffs.grnsClearedAt!))
+    : allGrns;
+
+  const allReturns = sortByDateDesc((slices.returns || []) as ReturnEntry[]);
+  const returns = cutoffs?.returnsClearedAt
+    ? allReturns.filter((r) => Boolean(r.date && r.date > cutoffs.returnsClearedAt!))
+    : allReturns;
+
+  return ensureDefaults({
+    branches: sortByDateDesc((slices.branches || []) as Branch[]),
+    users: sortByDateDesc((slices.users || []) as User[]),
+    medicines,
+    patients: sortByDateDesc((slices.patients || []) as Patient[]),
+    doctors: sortByDateDesc((slices.doctors || []) as Doctor[]),
+    invoices,
+    suppliers: [...((slices.suppliers || []) as Supplier[])].sort((a, b) => a.name.localeCompare(b.name)),
+    grns,
+    returns,
+    audit,
+    counters: counters || { invoice: 1000, grn: 500 },
+  });
+}
+
+async function syncCollection<K extends EntityKey>(collectionName: string, prevItems: AppData[K], nextItems: AppData[K]) {
+  if (!db) return;
+  const prevMap = new Map((prevItems as Array<{ id: string }>).map((item) => [item.id, item]));
+  const nextMap = new Map((nextItems as Array<{ id: string }>).map((item) => [item.id, item]));
+  const operations: Array<{ type: "set" | "delete"; id: string; data?: unknown }> = [];
+
+  for (const [id, item] of nextMap.entries()) {
+    const prev = prevMap.get(id);
+    if (!prev || stableStringify(prev) !== stableStringify(item)) {
+      operations.push({ type: "set", id, data: removeUndefined(item) });
+    }
+  }
+
+  for (const [id] of prevMap.entries()) {
+    if (!nextMap.has(id)) {
+      // Security rules prohibit deleting from append-only audit trail
+      if (collectionName !== COLLECTIONS.audit) {
+        operations.push({ type: "delete", id });
+      }
+    }
+  }
+
+  for (let i = 0; i < operations.length; i += 400) {
+    const batch = writeBatch(db);
+    const chunk = operations.slice(i, i + 400);
+    chunk.forEach((op) => {
+      const ref = doc(db, collectionName, op.id);
+      if (op.type === "set") batch.set(ref, op.data as Record<string, unknown>);
+      else batch.delete(ref);
+    });
+    await batch.commit();
+  }
+}
+
+async function syncCloudData(prev: AppData, next: AppData) {
+  if (!db) return;
+  const ensured = ensureDefaults(next);
+  const previous = ensureDefaults(prev);
+
+  await Promise.all([
+    syncCollection(COLLECTIONS.branches, previous.branches, ensured.branches),
+    syncCollection(COLLECTIONS.users, previous.users, ensured.users),
+    syncCollection(COLLECTIONS.medicines, previous.medicines, ensured.medicines),
+    syncCollection(COLLECTIONS.patients, previous.patients, ensured.patients),
+    syncCollection(COLLECTIONS.doctors, previous.doctors, ensured.doctors),
+    syncCollection(COLLECTIONS.invoices, previous.invoices, ensured.invoices),
+    syncCollection(COLLECTIONS.suppliers, previous.suppliers, ensured.suppliers),
+    syncCollection(COLLECTIONS.grns, previous.grns, ensured.grns),
+    syncCollection(COLLECTIONS.returns, previous.returns, ensured.returns),
+    syncCollection(COLLECTIONS.audit, previous.audit, ensured.audit),
+  ]);
+
+  await setDoc(doc(db, COLLECTIONS.meta, "app"), {
+    counters: ensured.counters,
+    initialized: true,
+    updatedAt: new Date().toISOString(),
+  }, { merge: true });
+}
+
+async function seedCloudIfEmpty(seed: AppData) {
+  if (!db) return;
+  const metaRef = doc(db, COLLECTIONS.meta, "app");
+  const metaSnap = await getDoc(metaRef);
+  if (metaSnap.exists()) return;
+
+  const batch = writeBatch(db);
+  const data = ensureDefaults(seed);
+  ENTITY_KEYS.forEach((key) => {
+    (data[key] as Array<{ id: string }>).forEach((item) => {
+      batch.set(doc(db, COLLECTIONS[key], item.id), removeUndefined(item));
+    });
+  });
+  batch.set(metaRef, {
+    counters: data.counters,
+    initialized: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  await batch.commit();
+}
+
+interface StoreCtx {
+  data: AppData;
+  setData: (updater: (d: AppData) => AppData) => void;
+  currentUser: User | null;
+  currentBranch: Branch | null;
+  viewBranchId: string | null;
+  setViewBranchId: (id: string | null) => void;
+  flags: FeatureFlags;
+  setFlag: (key: keyof FeatureFlags, value: boolean) => void;
+  setFlagsBatch: (patch: Partial<FeatureFlags>) => void;
+  staffPlan: StaffPlanTier;
+  setStaffPlan: (tier: StaffPlanTier, customLimits?: StaffPlanLimits) => void;
+  customStaffPlanLimits: StaffPlanLimits;
+  setCustomStaffPlanLimits: (limits: StaffPlanLimits) => void;
+  payment: PaymentSettings;
+  setPayment: (patch: Partial<PaymentSettings>) => void;
+  branchPayments: Record<string, PaymentSettings>;
+  setBranchPayment: (branchId: string, patch: Partial<PaymentSettings>) => void;
+  branchProfiles: Record<string, import("./types").StoreProfile>;
+  setBranchProfile: (branchId: string, patch: Partial<import("./types").StoreProfile>) => void;
+  storeProfile: import("./types").StoreProfile;
+  setStoreProfile: (patch: Partial<import("./types").StoreProfile>) => void;
+  login: (username: string, password: string) => { ok: boolean; message?: string };
+  logout: () => void;
+  log: (action: string, details?: string) => void;
+  flashToast: typeof flashToast;
+  cloudReady: boolean;
+  cloudSyncing: boolean;
+  cloudError: string;
+  buildBranchBackup: (branchId?: string) => BranchBackupFile;
+  restoreBranchBackup: (branchId: string, incoming: AppData, extras?: { payment?: PaymentSettings; profile?: import("./types").StoreProfile }) => void;
+  clearAuditLog: () => Promise<void>;
+  purgeAllBusinessData: () => Promise<void>;
+  createUser: (user: Omit<User, "id" | "createdAt"> & { id?: string; createdAt?: string }) => Promise<User>;
+  updateUser: (id: string, patch: Partial<User>) => Promise<User>;
+  deleteUser: (id: string) => Promise<boolean>;
+}
+
+const Ctx = createContext<StoreCtx | null>(null);
+
+export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [fullData, setDataRaw] = useState<AppData>(() => initialData());
+  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+    try {
+      const raw = sessionStorage.getItem(SESSION_KEY);
+      return raw ? (JSON.parse(raw) as User) : null;
+    } catch {
+      return null;
+    }
+  });
+  const actingRoleRef = useRef(currentUser?.role);
+  actingRoleRef.current = currentUser?.role;
+  const [currentBranch, setCurrentBranch] = useState<Branch | null>(() => {
+    try {
+      const raw = sessionStorage.getItem(BRANCH_SESSION_KEY);
+      return raw ? (JSON.parse(raw) as Branch) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [cloudReady, setCloudReady] = useState(false);
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [cloudError, setCloudError] = useState("");
+  // Super Admin branch switcher: null = all branches, otherwise focused branch id
+  const [viewBranchId, setViewBranchId] = useState<string | null>(null);
+  // Developer-controlled feature flags — synced through the meta doc
+  const [flags, setFlags] = useState<FeatureFlags>(DEFAULT_FEATURE_FLAGS);
+  const [staffPlan, setStaffPlanState] = useState<StaffPlanTier>(() => {
+    try {
+      const saved = Number(localStorage.getItem("gp_staff_plan"));
+      if (isStaffPlanTier(saved)) return saved;
+    } catch {}
+    return DEFAULT_STAFF_PLAN;
+  });
+  const [customStaffPlanLimits, setCustomStaffPlanLimitsState] = useState<StaffPlanLimits>(() => {
+    try {
+      const saved = localStorage.getItem("gp_custom_staff_limits");
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return DEFAULT_CUSTOM_STAFF_LIMITS;
+  });
+  const customStaffPlanLimitsRef = useRef(customStaffPlanLimits);
+  customStaffPlanLimitsRef.current = customStaffPlanLimits;
+
+  const setFlagsBatch = useCallback((patch: Partial<FeatureFlags>) => {
+    setFlags((prev) => {
+      const next = { ...prev, ...patch };
+      if (db) {
+        setDoc(doc(db, COLLECTIONS.meta, "app"), { featureFlags: next }, { merge: true }).catch(() => {});
+      }
+      const retentionMs = getAuditRetentionMs(next);
+      if (retentionMs !== null) {
+        const cutoff = Date.now() - retentionMs;
+        setDataRaw((d) => {
+          const filtered = d.audit.filter((e) => new Date(e.timestamp).getTime() >= cutoff);
+          if (filtered.length !== d.audit.length) {
+            const nextData = { ...d, audit: filtered };
+            saveLocalData(nextData);
+            return nextData;
+          }
+          return d;
+        });
+      }
+      return next;
+    });
+  }, []);
+
+  const setFlag = useCallback((key: keyof FeatureFlags, value: boolean) => {
+    setFlags((prev) => {
+      const next = { ...prev, [key]: value };
+      if (db) {
+        setDoc(doc(db, COLLECTIONS.meta, "app"), { featureFlags: next }, { merge: true }).catch(() => {});
+      }
+      if (key === "auditRetention30" || key === "auditRetention60" || key === "auditRetentionLifetime") {
+        const retentionMs = getAuditRetentionMs(next);
+        if (retentionMs !== null) {
+          const cutoff = Date.now() - retentionMs;
+          setDataRaw((d) => {
+            const filtered = d.audit.filter((e) => new Date(e.timestamp).getTime() >= cutoff);
+            if (filtered.length !== d.audit.length) {
+              const nextData = { ...d, audit: filtered };
+              saveLocalData(nextData);
+              return nextData;
+            }
+            return d;
+          });
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const setStaffPlan = useCallback((tier: StaffPlanTier, customLimits?: StaffPlanLimits) => {
+    const role = actingRoleRef.current;
+    if (role !== "developer" && role !== "superadmin") return;
+    if (!isStaffPlanTier(tier)) return;
+    setStaffPlanState(tier);
+    try {
+      localStorage.setItem("gp_staff_plan", String(tier));
+    } catch {}
+    const activeCustom = customLimits || customStaffPlanLimitsRef.current;
+    if (customLimits) {
+      setCustomStaffPlanLimitsState(customLimits);
+      try {
+        localStorage.setItem("gp_custom_staff_limits", JSON.stringify(customLimits));
+      } catch {}
+    }
+    if (!planAllowsMultiBranch(tier, activeCustom)) setViewBranchId(null);
+    if (db) {
+      const payload: Record<string, unknown> = { staffPlan: tier };
+      if (customLimits) {
+        payload.customStaffPlanLimits = customLimits;
+      }
+      setDoc(doc(db, COLLECTIONS.meta, "app"), payload, { merge: true }).catch(() => {});
+    }
+    fetch("/api/staff-plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ staffPlan: tier, customLimits: activeCustom }),
+    }).catch(() => {});
+  }, []);
+
+  const setCustomStaffPlanLimits = useCallback((limits: StaffPlanLimits) => {
+    const role = actingRoleRef.current;
+    if (role !== "developer" && role !== "superadmin") return;
+    setCustomStaffPlanLimitsState(limits);
+    try {
+      localStorage.setItem("gp_custom_staff_limits", JSON.stringify(limits));
+    } catch {}
+    if (db) {
+      setDoc(doc(db, COLLECTIONS.meta, "app"), { customStaffPlanLimits: limits }, { merge: true }).catch(() => {});
+    }
+    fetch("/api/staff-plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ staffPlan: 5, customLimits: limits }),
+    }).catch(() => {});
+  }, []);
+
+  // Payment settings (UPI QR etc.) — synced through the meta doc
+  const [payment, setPaymentState] = useState<PaymentSettings>({});
+
+  // Branch-level payment settings: { [branchId]: PaymentSettings }
+  const [branchPayments, setBranchPayments] = useState<Record<string, PaymentSettings>>({});
+  const migratedRef = useRef(false);
+
+  // Branch-level store profiles (pharmacy name, address, contact, GSTIN)
+  const [branchProfiles, setBranchProfiles] = useState<Record<string, import("./types").StoreProfile>>({});
+
+  // Single-branch Pharmacy Profile (saved in meta.app and branches.br_main)
+  const [storeProfile, setStoreProfileState] = useState<import("./types").StoreProfile>(() => {
+    try {
+      const raw = localStorage.getItem("gp_store_profile");
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return {
+      name: "Guru Pharmacy",
+      address: "",
+      contact: "",
+      gstNumber: "",
+      dlNumber: "",
+      tagline: "Quality Healthcare & Medicines",
+      email: "",
+    };
+  });
+
+  const setStoreProfile = useCallback((patch: Partial<import("./types").StoreProfile>) => {
+    setStoreProfileState((prev) => {
+      const next = { ...prev, ...patch };
+      try {
+        localStorage.setItem("gp_store_profile", JSON.stringify(next));
+      } catch {}
+
+      // Keep branchProfiles.br_main in sync
+      setBranchProfiles((bp) => ({ ...bp, br_main: next }));
+
+      // Also update fullData.branches[0] so invoice and branch lookups match immediately
+      setDataRaw((d) => {
+        const branches = (d.branches || []).map((b, idx) => {
+          if (idx === 0 || b.id === "br_main") {
+            return {
+              ...b,
+              storeName: next.name || b.storeName,
+              name: next.name || b.name,
+              address: next.address ?? b.address,
+              phone: next.contact ?? b.phone,
+              gstNumber: next.gstNumber ?? b.gstNumber,
+            };
+          }
+          return b;
+        });
+        const nextFull = { ...d, branches };
+        saveLocalData(nextFull);
+        fullDataRef.current = nextFull;
+        return nextFull;
+      });
+
+      if (currentBranchRef.current) {
+        const updatedCurrent: Branch = {
+          ...currentBranchRef.current,
+          storeName: next.name || currentBranchRef.current.storeName,
+          name: next.name || currentBranchRef.current.name,
+          address: next.address ?? currentBranchRef.current.address,
+          phone: next.contact ?? currentBranchRef.current.phone,
+          gstNumber: next.gstNumber ?? currentBranchRef.current.gstNumber,
+        };
+        setCurrentBranch(updatedCurrent);
+        sessionStorage.setItem(BRANCH_SESSION_KEY, JSON.stringify(updatedCurrent));
+      }
+
+      if (db) {
+        const wire: Record<string, unknown> = {};
+        (Object.keys(patch) as (keyof import("./types").StoreProfile)[]).forEach((k) => {
+          const v = patch[k];
+          wire[k] = v === undefined ? deleteField() : v;
+        });
+        setDoc(doc(db, COLLECTIONS.meta, "app"), {
+          storeProfile: next,
+          branchProfiles: { br_main: wire },
+        }, { merge: true }).catch(() => {});
+
+        setDoc(doc(db, COLLECTIONS.branches, "br_main"), {
+          name: next.name || "Main Pharmacy",
+          storeName: next.name || "Guru Pharmacy",
+          address: next.address || "",
+          phone: next.contact || "",
+          gstNumber: next.gstNumber || "",
+          active: true,
+        }, { merge: true }).catch(() => {});
+      }
+
+      return next;
+    });
+  }, []);
+
+  const setBranchProfile = useCallback((branchId: string, patch: Partial<import("./types").StoreProfile>) => {
+    setBranchProfiles((prev) => {
+      const current = prev[branchId] || {};
+      const next = { ...current };
+      const wire: Record<string, unknown> = {};
+      (Object.keys(patch) as (keyof import("./types").StoreProfile)[]).forEach((k) => {
+        const v = patch[k];
+        if (v === undefined) {
+          delete next[k];
+          wire[k] = deleteField();
+        } else {
+          next[k] = v;
+          wire[k] = v;
+        }
+      });
+      if (db) {
+        setDoc(doc(db, COLLECTIONS.meta, "app"), { branchProfiles: { [branchId]: wire } }, { merge: true }).catch(() => {});
+      }
+      return { ...prev, [branchId]: next };
+    });
+  }, []);
+
+  const setBranchPayment = useCallback((branchId: string, patch: Partial<PaymentSettings>) => {
+    setBranchPayments((prev) => {
+      const current = prev[branchId] || {};
+      const next: PaymentSettings = { ...current };
+      const wire: Record<string, unknown> = {};
+      (Object.keys(patch) as (keyof PaymentSettings)[]).forEach((k) => {
+        const v = patch[k];
+        if (v === undefined) {
+          delete next[k];
+          wire[k] = deleteField();
+        } else {
+          (next as any)[k] = v;
+          wire[k] = v;
+        }
+      });
+      if (db) {
+        setDoc(doc(db, COLLECTIONS.meta, "app"), { branchPayments: { [branchId]: wire } }, { merge: true }).catch(() => {});
+      }
+      return { ...prev, [branchId]: next };
+    });
+  }, []);
+
+  const setPayment = useCallback((patch: Partial<PaymentSettings>) => {
+    setPaymentState((prev) => {
+      const next: PaymentSettings = { ...prev };
+      const wire: Record<string, unknown> = {};
+      (Object.keys(patch) as (keyof PaymentSettings)[]).forEach((k) => {
+        const v = patch[k];
+        if (v === undefined) {
+          delete next[k];
+          wire[k] = deleteField();
+        } else {
+          (next as any)[k] = v;
+          wire[k] = v;
+        }
+      });
+      if (db) {
+        setDoc(doc(db, COLLECTIONS.meta, "app"), { payment: wire, branchPayments: { br_main: wire } }, { merge: true }).catch(() => {});
+      }
+      setBranchPayments((bp) => ({ ...bp, br_main: next }));
+      return next;
+    });
+  }, []);
+
+  const currentUserRef = useRef(currentUser);
+  currentUserRef.current = currentUser;
+  const currentBranchRef = useRef(currentBranch);
+  currentBranchRef.current = currentBranch;
+  const fullDataRef = useRef(fullData);
+  fullDataRef.current = fullData;
+  const viewBranchRef = useRef(viewBranchId);
+  viewBranchRef.current = viewBranchId;
+  const flagsRef = useRef(flags);
+  flagsRef.current = flags;
+  const staffPlanRef = useRef(staffPlan);
+  staffPlanRef.current = staffPlan;
+
+  const setViewBranchIdGuarded = useCallback((id: string | null) => {
+    if (id !== null && !planAllowsMultiBranch(staffPlanRef.current)) return;
+    setViewBranchId(id);
+  }, []);
+  const branchPaymentsRef = useRef(branchPayments);
+  branchPaymentsRef.current = branchPayments;
+  const branchProfilesRef = useRef(branchProfiles);
+  branchProfilesRef.current = branchProfiles;
+
+  // Dynamic retention: respects developer-configured retention policy (30 days, 60 days, or lifetime)
+  const pruneAuditWithFlags = useCallback((entries: AuditLog[], f: FeatureFlags) => {
+    const retentionMs = getAuditRetentionMs(f);
+    if (retentionMs === null) {
+      // Lifetime storage: never purge logs based on age
+      return entries;
+    }
+    const cutoff = Date.now() - retentionMs;
+    return entries.filter((e) => new Date(e.timestamp).getTime() >= cutoff);
+  }, []);
+
+  const pruneAudit = useCallback(
+    (entries: AuditLog[]) => {
+      return pruneAuditWithFlags(entries, flagsRef.current);
+    },
+    [pruneAuditWithFlags]
+  );
+
+  // Purge stale logs once cloud snapshot arrives, then re-check hourly or upon policy changes
+  const purgedRef = useRef(false);
+  useEffect(() => {
+    if (!cloudReady) return;
+    const checkStale = () => {
+      const retentionMs = getAuditRetentionMs(flagsRef.current);
+      if (retentionMs === null) return;
+      const cutoff = Date.now() - retentionMs;
+      if (fullDataRef.current.audit.some((e) => new Date(e.timestamp).getTime() < cutoff)) {
+        setDataRaw((prev) => {
+          const next = { ...prev, audit: pruneAuditWithFlags(prev.audit, flagsRef.current) };
+          saveLocalData(next);
+          return next;
+        });
+      }
+    };
+
+    if (!purgedRef.current) {
+      purgedRef.current = true;
+      checkStale();
+    } else {
+      checkStale();
+    }
+
+    const t = window.setInterval(checkStale, 60 * 60 * 1000);
+    return () => window.clearInterval(t);
+  }, [cloudReady, pruneAuditWithFlags, flags.auditRetention30, flags.auditRetention60, flags.auditRetentionLifetime]);
+
+
+
+  // Branch scope: overseers see all (or a focused branch); others only their own
+  const scopeBranch = scopeBranchOf(currentUser, viewBranchId);
+
+  // Pages read only their own branch's data
+  const data = useMemo(() => scopeData(fullData, scopeBranch), [fullData, scopeBranch]);
+
+  const applyUpdate = useCallback((updater: (d: AppData) => AppData) => {
+    setDataRaw((prevFull) => {
+      const branchId = scopeBranchOf(currentUserRef.current, viewBranchRef.current);
+      const scopedPrev = scopeData(prevFull, branchId);
+      const scopedNext = updater(scopedPrev);
+      const nextFull = mergeScoped(prevFull, scopedNext, branchId);
+      saveLocalData(nextFull);
+      setCloudSyncing(true);
+      void syncCloudData(prevFull, nextFull)
+        .then(() => {
+          setCloudError("");
+          setCloudSyncing(false);
+        })
+        .catch((err) => {
+          setCloudError(friendlyCloudError(err));
+          setCloudSyncing(false);
+        });
+      return nextFull;
+    });
+  }, []);
+
+  const setData = useCallback((updater: (d: AppData) => AppData) => {
+    applyUpdate(updater);
+  }, [applyUpdate]);
+
+  const buildBranchBackup = useCallback((_branchId?: string): BranchBackupFile => {
+    const activeBranch = fullDataRef.current.branches[0] || starterBranch;
+    return {
+      kind: "guru-branch",
+      version: 1,
+      branchId: activeBranch.id,
+      exportedAt: new Date().toISOString(),
+      data: fullDataRef.current,
+      payment: payment,
+      profile: storeProfile,
+    };
+  }, [payment, storeProfile]);
+
+  const restoreBranchBackup = useCallback((
+    _branchId: string,
+    incoming: AppData,
+    extras?: { payment?: PaymentSettings; profile?: import("./types").StoreProfile }
+  ) => {
+    setDataRaw((_prevFull) => {
+      const nextFull = ensureDefaults(incoming);
+      saveLocalData(nextFull);
+      setCloudSyncing(true);
+      void syncCloudData(nextFull, nextFull)
+        .then(() => {
+          setCloudError("");
+          setCloudSyncing(false);
+        })
+        .catch((err) => {
+          setCloudError(friendlyCloudError(err));
+          setCloudSyncing(false);
+        });
+      return nextFull;
+    });
+    if (extras?.payment) {
+      setPayment(extras.payment);
+    }
+    if (extras?.profile) {
+      setStoreProfile(extras.profile);
+    }
+  }, [setPayment, setStoreProfile]);
+
+  const log = useCallback((action: string, details?: string) => {
+    // Audit logging can be disabled from the developer Feature Controls (Master Switch)
+    if (!flagsRef.current.auditEnabled) return;
+    const entry: AuditLog = {
+      id: "a_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+      branchId: currentBranchRef.current?.id,
+      user: currentUserRef.current?.username || "system",
+      action,
+      details,
+      timestamp: new Date().toISOString(),
+    };
+    const maxEntries = flagsRef.current.auditRetentionLifetime ? 10000 : 2000;
+    applyUpdate((prev) => ({ ...prev, audit: [entry, ...pruneAudit(prev.audit)].slice(0, maxEntries) }));
+    fetch("/api/audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    }).catch(() => {});
+  }, [applyUpdate, pruneAudit]);
+
+  const login = useCallback((username: string, password: string) => {
+    const allUsers = fullDataRef.current.users;
+    const user = allUsers.find((x) => x.username === username.trim());
+    if (!cloudReady && allUsers.length === 0) return { ok: false, message: "Connecting to cloud data. Please wait..." };
+    if (!user) return { ok: false, message: "User not found" };
+    if (!user.active) return { ok: false, message: "Account is deactivated. Contact admin." };
+    if (user.password !== password) return { ok: false, message: "Incorrect password" };
+
+    const ensuredUser: User = { ...user, branchId: user.branchId || "br_main" };
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(ensuredUser));
+    setCurrentUser(ensuredUser);
+
+    const branch = fullDataRef.current.branches[0] || starterBranch;
+    setCurrentBranch(branch);
+    sessionStorage.setItem(BRANCH_SESSION_KEY, JSON.stringify(branch));
+    setViewBranchId(null);
+
+    log("LOGIN", `${user.role} logged in`);
+    return { ok: true };
+  }, [cloudReady, log]);
+
+  const logout = useCallback(() => {
+    const user = currentUserRef.current;
+    if (user) {
+      applyUpdate((prev) => ({
+        ...prev,
+        audit: [{
+          id: "a_" + Date.now(),
+          branchId: currentBranchRef.current?.id,
+          user: user.username,
+          action: "LOGOUT",
+          timestamp: new Date().toISOString(),
+        }, ...prev.audit].slice(0, 1000),
+      }));
+    }
+    sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(BRANCH_SESSION_KEY);
+    setCurrentUser(null);
+    setCurrentBranch(null);
+    setViewBranchId(null);
+  }, [applyUpdate]);
+
+  const clearAuditLog = useCallback(async () => {
+    const now = new Date().toISOString();
+    applyUpdate((prev) => ({ ...prev, audit: [] }));
+    if (db) {
+      try {
+        await setDoc(doc(db, COLLECTIONS.meta, "app"), { auditClearedAt: now, updatedAt: now }, { merge: true });
+      } catch (err) {
+        console.warn("[clearAuditLog error]", err);
+      }
+    }
+    flashToast("Audit log cleared", "ok");
+  }, [applyUpdate]);
+
+  const purgeAllBusinessData = useCallback(async () => {
+    const now = new Date().toISOString();
+    applyUpdate((prev) => ({
+      ...prev,
+      invoices: [],
+      medicines: [],
+      audit: [],
+      grns: [],
+      returns: [],
+      counters: { invoice: 1000, grn: 500 },
+    }));
+    if (db) {
+      try {
+        await setDoc(doc(db, COLLECTIONS.meta, "app"), {
+          auditClearedAt: now,
+          invoicesClearedAt: now,
+          medicinesClearedAt: now,
+          grnsClearedAt: now,
+          returnsClearedAt: now,
+          counters: { invoice: 1000, grn: 500 },
+          updatedAt: now,
+        }, { merge: true });
+      } catch (err) {
+        console.warn("[purgeAllBusinessData error]", err);
+      }
+    }
+    flashToast("All old invoices, inventory, reports & audit logs purged", "ok");
+  }, [applyUpdate]);
+
+  const slicesRef = useRef<Partial<FirestoreSlices>>({});
+
+  const createUser = useCallback(async (userData: Omit<User, "id" | "createdAt"> & { id?: string; createdAt?: string }): Promise<User> => {
+    const id = userData.id || uid("u");
+    const createdAt = userData.createdAt || new Date().toISOString();
+    const newUser: User = {
+      ...userData,
+      branchId: userData.branchId || "br_main",
+      id,
+      createdAt,
+    };
+
+    if (slicesRef.current.users) {
+      slicesRef.current.users = [newUser, ...(slicesRef.current.users as User[]).filter((u) => u.id !== id)];
+    }
+
+    setDataRaw((prev) => {
+      const nextUsers = [newUser, ...prev.users.filter((u) => u.id !== id)];
+      const nextFull = { ...prev, users: nextUsers };
+      saveLocalData(nextFull);
+      fullDataRef.current = nextFull;
+      return nextFull;
+    });
+
+    if (db) {
+      try {
+        await setDoc(doc(db, COLLECTIONS.users, id), removeUndefined(newUser));
+      } catch (err) {
+        console.warn("[createUser firestore error]", err);
+      }
+    }
+
+    try {
+      await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newUser),
+      });
+    } catch (err) {
+      console.warn("[createUser backend error]", err);
+    }
+
+    return newUser;
+  }, []);
+
+  const updateUser = useCallback(async (id: string, patch: Partial<User>): Promise<User> => {
+    const current = fullDataRef.current.users.find((u) => u.id === id);
+    if (!current) throw new Error("User not found");
+
+    let role = patch.role || current.role;
+    if (current.username === "guru" || current.role === "developer") {
+      role = "developer";
+    }
+
+    const updatedUser: User = {
+      ...current,
+      ...patch,
+      id,
+      role,
+    };
+
+    if (slicesRef.current.users) {
+      slicesRef.current.users = (slicesRef.current.users as User[]).map((u) => (u.id === id ? updatedUser : u));
+    }
+
+    setDataRaw((prev) => {
+      const nextUsers = prev.users.map((u) => (u.id === id ? updatedUser : u));
+      const nextFull = { ...prev, users: nextUsers };
+      saveLocalData(nextFull);
+      fullDataRef.current = nextFull;
+      return nextFull;
+    });
+
+    if (currentUserRef.current?.id === id) {
+      setCurrentUser(updatedUser);
+      try {
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify(updatedUser));
+      } catch {}
+    }
+
+    if (db) {
+      try {
+        await setDoc(doc(db, COLLECTIONS.users, id), removeUndefined(updatedUser), { merge: true });
+      } catch (err) {
+        console.warn("[updateUser firestore error]", err);
+      }
+    }
+
+    try {
+      await fetch(`/api/users/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+    } catch (err) {
+      console.warn("[updateUser backend error]", err);
+    }
+
+    return updatedUser;
+  }, []);
+
+  const deleteUser = useCallback(async (id: string): Promise<boolean> => {
+    const target = fullDataRef.current.users.find((u) => u.id === id);
+    if (!target) return true;
+
+    if (target.role === "developer" || target.username === "guru") {
+      throw new Error("Cannot delete primary developer account");
+    }
+
+    if (target.id === currentUserRef.current?.id) {
+      throw new Error("Cannot delete your own account");
+    }
+
+    if (slicesRef.current.users) {
+      slicesRef.current.users = (slicesRef.current.users as User[]).filter((u) => u.id !== id);
+    }
+
+    setDataRaw((prev) => {
+      const nextUsers = prev.users.filter((u) => u.id !== id);
+      const nextFull = { ...prev, users: nextUsers };
+      saveLocalData(nextFull);
+      fullDataRef.current = nextFull;
+      return nextFull;
+    });
+
+    if (db) {
+      try {
+        await deleteDoc(doc(db, COLLECTIONS.users, id));
+      } catch (err) {
+        console.warn("[deleteUser firestore error]", err);
+      }
+    }
+
+    try {
+      await fetch(`/api/users/${id}`, {
+        method: "DELETE",
+      });
+    } catch (err) {
+      console.warn("[deleteUser backend error]", err);
+    }
+
+    return true;
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    if (!db) {
+      setCloudError("Database connection not initialized. Please verify your Firebase credentials.");
+      return;
+    }
+    const localSeed = initialData();
+    const slices = slicesRef.current;
+    let counters: AppData["counters"] | null = null;
+    let cutoffs: CloudCutoffs = {};
+    let metaReady = false;
+    const loaded = new Set<string>();
+
+    const tryCompose = () => {
+      if (disposed) return;
+      if (!metaReady) return;
+      if (ENTITY_KEYS.some((key) => !loaded.has(key))) return;
+      const next = normalizeCloudData(slices, counters, cutoffs);
+      setDataRaw(next);
+      saveLocalData(next);
+      fullDataRef.current = next;
+      setCloudReady(true);
+      setCloudError("");
+    };
+
+    const unsubscribers = ENTITY_KEYS.map((key) =>
+      onSnapshot(
+        collection(db, COLLECTIONS[key]),
+        (snapshot) => {
+          slices[key] = snapshot.docs.map((snap) => ({ id: snap.id, ...snap.data() })) as AppData[typeof key];
+          loaded.add(key);
+          tryCompose();
+        },
+        (err) => {
+          setCloudError(friendlyCloudError(err));
+          setCloudReady(false);
+        }
+      )
+    );
+
+    const unsubMeta = onSnapshot(
+      doc(db, COLLECTIONS.meta, "app"),
+      (snapshot) => {
+        counters = snapshot.exists() ? ((snapshot.data().counters as AppData["counters"]) || { invoice: 1000, grn: 500 }) : null;
+        if (snapshot.exists()) {
+          const mdata = snapshot.data();
+          cutoffs = {
+            auditClearedAt: (mdata?.auditClearedAt as string) || null,
+            invoicesClearedAt: (mdata?.invoicesClearedAt as string) || null,
+            medicinesClearedAt: (mdata?.medicinesClearedAt as string) || null,
+            grnsClearedAt: (mdata?.grnsClearedAt as string) || null,
+            returnsClearedAt: (mdata?.returnsClearedAt as string) || null,
+          };
+          const ff = snapshot.data().featureFlags as Partial<FeatureFlags> | undefined;
+          if (ff) setFlags({ ...DEFAULT_FEATURE_FLAGS, ...ff });
+          const nextPlan: StaffPlanTier = isStaffPlanTier(snapshot.data().staffPlan)
+            ? snapshot.data().staffPlan
+            : DEFAULT_STAFF_PLAN;
+          setStaffPlanState(nextPlan);
+          try {
+            localStorage.setItem("gp_staff_plan", String(nextPlan));
+          } catch {}
+          const customLim = snapshot.data().customStaffPlanLimits as StaffPlanLimits | undefined;
+          if (customLim) {
+            setCustomStaffPlanLimitsState(customLim);
+            try {
+              localStorage.setItem("gp_custom_staff_limits", JSON.stringify(customLim));
+            } catch {}
+          }
+          if (!planAllowsMultiBranch(nextPlan, customLim || customStaffPlanLimitsRef.current)) {
+            setViewBranchId(null);
+          }
+          const pay = snapshot.data().payment as PaymentSettings | undefined;
+          if (pay) setPaymentState(pay);
+          const bp = (snapshot.data().branchPayments as Record<string, PaymentSettings> | undefined) || {};
+          setBranchPayments(bp);
+          const prof = (snapshot.data().branchProfiles as Record<string, import("./types").StoreProfile> | undefined) || {};
+          setBranchProfiles(prof);
+          const sp = (snapshot.data().storeProfile as import("./types").StoreProfile | undefined) || prof.br_main;
+          if (sp) {
+            setStoreProfileState(sp);
+            try {
+              localStorage.setItem("gp_store_profile", JSON.stringify(sp));
+            } catch {}
+          }
+          // One-time migration: fold legacy global payment into the main branch
+          if (pay && Object.keys(pay).length > 0 && Object.keys(bp).length === 0 && !migratedRef.current) {
+            migratedRef.current = true;
+            setDoc(doc(db, COLLECTIONS.meta, "app"), { branchPayments: { br_main: pay }, payment: deleteField() }, { merge: true }).catch(() => {});
+          }
+        }
+        metaReady = snapshot.exists();
+        tryCompose();
+      },
+      (err) => {
+        setCloudError(friendlyCloudError(err));
+        setCloudReady(false);
+      }
+    );
+
+    void seedCloudIfEmpty(localSeed).catch((err) => {
+      setCloudError(friendlyCloudError(err));
+      setCloudReady(false);
+    });
+
+    return () => {
+      disposed = true;
+      unsubscribers.forEach((unsub) => unsub());
+      unsubMeta();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    const latestUser = fullData.users.find((u) => u.id === currentUser.id || u.username === currentUser.username);
+    if (!latestUser) return;
+
+    if (!latestUser.active) {
+      sessionStorage.removeItem(SESSION_KEY);
+      sessionStorage.removeItem(BRANCH_SESSION_KEY);
+      setCurrentUser(null);
+      setCurrentBranch(null);
+      return;
+    }
+
+    if (stableStringify(latestUser) !== stableStringify(currentUser)) {
+      setCurrentUser(latestUser);
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(latestUser));
+    }
+
+    const branch = fullData.branches[0] || starterBranch;
+    if (!currentBranch || branch.id !== currentBranch.id || branch.name !== currentBranch.name || branch.storeName !== currentBranch.storeName) {
+      setCurrentBranch(branch);
+      sessionStorage.setItem(BRANCH_SESSION_KEY, JSON.stringify(branch));
+    }
+  }, [currentUser, currentBranch, fullData.users, fullData.branches]);
+
+  // One-time cleanup: remove the legacy "jk" test super-admin (requested removal).
+  // Runs once per device; the resulting sync deletes the record from Firebase too.
+  useEffect(() => {
+    if (localStorage.getItem("gp_removed_jk")) return;
+    localStorage.setItem("gp_removed_jk", "1");
+    if (fullDataRef.current.users.some((u) => u.username === "jk")) {
+      setData((d) => ({ ...d, users: d.users.filter((u) => u.username !== "jk") }));
+    }
+  }, [setData]);
+
+  const value = useMemo<StoreCtx>(() => ({
+    data,
+    setData,
+    currentUser,
+    currentBranch,
+    viewBranchId,
+    setViewBranchId: setViewBranchIdGuarded,
+    flags,
+    setFlag,
+    setFlagsBatch,
+    staffPlan,
+    setStaffPlan,
+    customStaffPlanLimits,
+    setCustomStaffPlanLimits,
+    payment,
+    setPayment,
+    branchPayments,
+    setBranchPayment,
+    branchProfiles,
+    setBranchProfile,
+    storeProfile,
+    setStoreProfile,
+    login,
+    logout,
+    log,
+    flashToast,
+    cloudReady,
+    cloudSyncing,
+    cloudError,
+    buildBranchBackup,
+    restoreBranchBackup,
+    clearAuditLog,
+    purgeAllBusinessData,
+    createUser,
+    updateUser,
+    deleteUser,
+  }), [data, setData, currentUser, currentBranch, viewBranchId, setViewBranchIdGuarded, flags, setFlag, setFlagsBatch, staffPlan, setStaffPlan, customStaffPlanLimits, setCustomStaffPlanLimits, payment, branchPayments, branchProfiles, storeProfile, setStoreProfile, login, logout, log, cloudReady, cloudSyncing, cloudError, buildBranchBackup, restoreBranchBackup, clearAuditLog, purgeAllBusinessData, createUser, updateUser, deleteUser]);
+
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+};
+
+export { flashToast } from "../utils/helpers";
+
+export function useStore() {
+  const ctx = useContext(Ctx);
+  if (!ctx) throw new Error("useStore must be used within StoreProvider");
+  return ctx;
+}
+
+export function uid(prefix = "id") {
+  return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}

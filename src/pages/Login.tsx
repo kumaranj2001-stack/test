@@ -178,9 +178,9 @@ const Login: React.FC = () => {
                 </div>
               )}
 
-              <Button type="submit" className="w-full" disabled={loading || (!cloudReady && !cloudError)}>
+              <Button type="submit" className="w-full" disabled={loading}>
                 {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                {loading ? "Signing in..." : !cloudReady && !cloudError ? "Connecting..." : "Sign In"}
+                {loading ? "Signing in..." : "Sign In"}
               </Button>
             </form>
           </div>

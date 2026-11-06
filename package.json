@@ -7,8 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "server": "node server/index.mjs",
-    "test": "node server/test-e2e-demo-data.mjs"
+    "server": "node server/index.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

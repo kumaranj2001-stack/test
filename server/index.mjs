@@ -367,7 +367,21 @@ const server = http.createServer(async (req, res) => {
         const urlId = (url.pathname.includes("/update")) ? null : pathParts[pathParts.length - 1];
         const id = payload.id || urlId;
         const role = payload.role || req.headers["x-user-role"] || "";
-        const { patch, medicines = [] } = payload;
+        let { patch, medicines = [] } = payload;
+        if (!medicines || medicines.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.medicines));
+            medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!medicines.some((m) => m && m.id === id)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.medicines, id));
+            if (docSnap.exists()) {
+              medicines.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
         const result = updateMedicine(id, patch || payload, medicines, role);
 
         // Update in Firestore gp_medicines
@@ -407,7 +421,21 @@ const server = http.createServer(async (req, res) => {
         const id = payload.id || pathParts[pathParts.length - 2];
         const role = payload.role || req.headers["x-user-role"] || "";
         const minStock = payload.minStock;
-        const medicines = payload.medicines || [];
+        let medicines = payload.medicines || [];
+        if (!medicines || medicines.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.medicines));
+            medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!medicines.some((m) => m && m.id === id)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.medicines, id));
+            if (docSnap.exists()) {
+              medicines.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
 
         const result = updateMedicineMinStock(id, minStock, role, medicines);
 
@@ -493,8 +521,28 @@ const server = http.createServer(async (req, res) => {
         const pathParts = url.pathname.split("/");
         const urlId = (url.pathname.includes("/delete")) ? null : pathParts[pathParts.length - 1];
         const id = payload.id || urlId;
-        const { medicines = [] } = payload;
-        const result = deleteMedicine(id, medicines);
+        let { medicines = [] } = payload;
+        if (!medicines || medicines.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.medicines));
+            medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!medicines.some((m) => m && m.id === id)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.medicines, id));
+            if (docSnap.exists()) {
+              medicines.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
+
+        let result;
+        if (medicines.some((m) => m && m.id === id)) {
+          result = deleteMedicine(id, medicines);
+        } else {
+          result = { success: true, id, medicines: [] };
+        }
 
         // Delete from Firestore gp_medicines
         try {
@@ -603,7 +651,7 @@ const server = http.createServer(async (req, res) => {
       if (body.length > 10 * 1024 * 1024) req.destroy();
     });
 
-    req.on("end", () => {
+    req.on("end", async () => {
       try {
         if (!body) return sendJson(res, 400, { success: false, error: "Empty request body" });
         const payload = JSON.parse(body);
@@ -612,9 +660,58 @@ const server = http.createServer(async (req, res) => {
           : null;
         const grnId = payload.grnId || urlId;
         const role = payload.role || req.headers["x-user-role"] || "";
-        const { patchData, grns = [], medicines = [], adjustStock = true } = payload;
+        let { patchData, grns = [], medicines = [], adjustStock = true } = payload;
+        if (!patchData && payload.grn) {
+          patchData = payload.grn;
+        }
+
+        if (!grns || grns.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.grns));
+            grns = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!grns.some((g) => g && g.id === grnId)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.grns, grnId));
+            if (docSnap.exists()) {
+              grns.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
+        if (!medicines || medicines.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.medicines));
+            medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
 
         const result = updateApprovedGrn(grnId, patchData || payload, grns, medicines, role, adjustStock);
+
+        // Persist to Firestore gp_grns and gp_medicines
+        try {
+          if (result.grn) {
+            const docData = {};
+            for (const [k, v] of Object.entries(result.grn)) {
+              if (v !== undefined) docData[k] = v;
+            }
+            await setDoc(doc(db, COLLECTIONS.grns, result.grn.id), docData, { merge: true });
+          }
+          if (Array.isArray(result.medicines)) {
+            for (const m of result.medicines) {
+              if (m && m.id) {
+                const medData = {};
+                for (const [k, v] of Object.entries(m)) {
+                  if (v !== undefined) medData[k] = v;
+                }
+                await setDoc(doc(db, COLLECTIONS.medicines, m.id), medData, { merge: true });
+              }
+            }
+          }
+        } catch (dbErr) {
+          console.warn("[Firebase approvedGrn update warning]", dbErr.message);
+        }
+
         return sendJson(res, 200, result);
       } catch (err) {
         const statusCode = err.message?.includes("Access Denied") ? 403 : 400;
@@ -631,7 +728,7 @@ const server = http.createServer(async (req, res) => {
       if (body.length > 10 * 1024 * 1024) req.destroy();
     });
 
-    req.on("end", () => {
+    req.on("end", async () => {
       try {
         const payload = body ? JSON.parse(body) : {};
         const urlId = url.pathname.startsWith("/api/grn/approved/") && url.pathname !== "/api/grn/approved/delete"
@@ -639,9 +736,57 @@ const server = http.createServer(async (req, res) => {
           : null;
         const grnId = payload.grnId || urlId;
         const role = payload.role || req.headers["x-user-role"] || url.searchParams.get("role") || "";
-        const { grns = [], medicines = [], reverseStock = true } = payload;
+        let { grns = [], medicines = [], reverseStock = true } = payload;
 
-        const result = deleteApprovedGrn(grnId, grns, medicines, role, reverseStock);
+        if (!grns || grns.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.grns));
+            grns = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!grns.some((g) => g && g.id === grnId)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.grns, grnId));
+            if (docSnap.exists()) {
+              grns.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
+        if (!medicines || medicines.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.medicines));
+            medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+
+        let result;
+        if (grns.some((g) => g && g.id === grnId)) {
+          result = deleteApprovedGrn(grnId, grns, medicines, role, reverseStock);
+        } else {
+          if (!isDeveloperRole(role)) {
+            throw new Error("Access Denied: Only Developer role can delete approved GRN entries.");
+          }
+          result = { success: true, grnId, medicines };
+        }
+
+        // Delete from Firestore gp_grns and update gp_medicines
+        try {
+          await deleteDoc(doc(db, COLLECTIONS.grns, grnId));
+          if (Array.isArray(result.medicines)) {
+            for (const m of result.medicines) {
+              if (m && m.id) {
+                const medData = {};
+                for (const [k, v] of Object.entries(m)) {
+                  if (v !== undefined) medData[k] = v;
+                }
+                await setDoc(doc(db, COLLECTIONS.medicines, m.id), medData, { merge: true });
+              }
+            }
+          }
+        } catch (dbErr) {
+          console.warn("[Firebase approvedGrn delete warning]", dbErr.message);
+        }
+
         return sendJson(res, 200, result);
       } catch (err) {
         const statusCode = err.message?.includes("Access Denied") ? 403 : 400;
@@ -757,7 +902,23 @@ const server = http.createServer(async (req, res) => {
           ? url.pathname.replace("/api/doctors/", "")
           : null;
         const id = payload.id || urlId;
-        const { patch, doctors = [] } = payload;
+        let { patch, doctors = [] } = payload;
+
+        if (!doctors || doctors.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.doctors));
+            doctors = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!doctors.some((d) => d && d.id === id)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.doctors, id));
+            if (docSnap.exists()) {
+              doctors.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
+
         const result = updateDoctor(id, patch || payload, doctors);
 
         // Update in Firestore gp_doctors
@@ -793,8 +954,29 @@ const server = http.createServer(async (req, res) => {
           ? url.pathname.replace("/api/doctors/", "")
           : null;
         const id = payload.id || urlId;
-        const { doctors = [] } = payload;
-        const result = deleteDoctor(id, doctors);
+        let { doctors = [] } = payload;
+
+        if (!doctors || doctors.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.doctors));
+            doctors = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {}
+        }
+        if (!doctors.some((d) => d && d.id === id)) {
+          try {
+            const docSnap = await getDoc(doc(db, COLLECTIONS.doctors, id));
+            if (docSnap.exists()) {
+              doctors.push({ id: docSnap.id, ...docSnap.data() });
+            }
+          } catch {}
+        }
+
+        let result;
+        if (doctors.some((d) => d && d.id === id)) {
+          result = deleteDoctor(id, doctors);
+        } else {
+          result = { success: true, id, doctors: [] };
+        }
 
         // Delete from Firestore gp_doctors
         try {

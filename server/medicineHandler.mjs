@@ -42,8 +42,8 @@ export function validateMedicinePayload(data = {}, options = {}) {
     }
   } else {
     const rawStock = Number(data.stock);
-    if (isNaN(rawStock) || rawStock <= 0) {
-      errors.push("Quantity must be a valid number greater than 0.");
+    if (isNaN(rawStock) || (requirePurchaseDetails ? rawStock <= 0 : rawStock < 0)) {
+      errors.push(requirePurchaseDetails ? "Quantity must be a valid number greater than 0." : "Quantity cannot be negative.");
     } else {
       parsedStock = Math.round(rawStock);
     }
@@ -57,8 +57,8 @@ export function validateMedicinePayload(data = {}, options = {}) {
     }
   } else {
     const rawPurchasePrice = Number(data.purchasePrice);
-    if (isNaN(rawPurchasePrice) || rawPurchasePrice <= 0) {
-      errors.push("Buying price must be a valid positive amount greater than 0.");
+    if (isNaN(rawPurchasePrice) || (requirePurchaseDetails ? rawPurchasePrice <= 0 : rawPurchasePrice < 0)) {
+      errors.push(requirePurchaseDetails ? "Buying price must be a valid positive amount greater than 0." : "Buying price cannot be negative.");
     } else {
       parsedPurchasePrice = Math.round(rawPurchasePrice * 100) / 100;
     }
@@ -72,8 +72,8 @@ export function validateMedicinePayload(data = {}, options = {}) {
     }
   } else {
     const rawSellingPrice = Number(data.sellingPrice);
-    if (isNaN(rawSellingPrice) || rawSellingPrice <= 0) {
-      errors.push("Selling price must be a valid positive amount greater than 0.");
+    if (isNaN(rawSellingPrice) || (requirePurchaseDetails ? rawSellingPrice <= 0 : rawSellingPrice < 0)) {
+      errors.push(requirePurchaseDetails ? "Selling price must be a valid positive amount greater than 0." : "Selling price cannot be negative.");
     } else {
       parsedSellingPrice = Math.round(rawSellingPrice * 100) / 100;
     }
@@ -124,6 +124,7 @@ export function validateMedicinePayload(data = {}, options = {}) {
       narcotic,
       minStock: parsedMinStock,
       branchId: data.branchId ? String(data.branchId).trim() : undefined,
+      createdAt: data.createdAt || new Date().toISOString(),
     },
   };
 }
@@ -149,7 +150,7 @@ export function createMedicine(payload = {}, medicines = [], options = {}) {
   const newMedicine = {
     id: payload.id || `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     ...clean,
-    createdAt: new Date().toISOString(),
+    createdAt: payload.createdAt || clean.createdAt || new Date().toISOString(),
   };
 
   return {
@@ -283,14 +284,16 @@ export function updateMedicine(id, patch = {}, medicines = [], role = "") {
  * @returns {Object} { success: boolean, id: string, medicines: Array }
  */
 export function deleteMedicine(id, medicines = []) {
-  const exists = medicines.some((m) => m && m.id === id);
-  if (!exists) {
-    const err = new Error(`Medicine with ID '${id}' not found.`);
-    err.statusCode = 404;
-    throw err;
+  if (medicines && medicines.length > 0) {
+    const exists = medicines.some((m) => m && m.id === id);
+    if (!exists) {
+      const err = new Error(`Medicine with ID '${id}' not found.`);
+      err.statusCode = 404;
+      throw err;
+    }
   }
 
-  const updatedList = medicines.filter((m) => m && m.id !== id);
+  const updatedList = (medicines || []).filter((m) => m && m.id !== id);
   return {
     success: true,
     id,

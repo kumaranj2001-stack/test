@@ -333,7 +333,7 @@ function normalizeCloudData(
 
   const allMedicines = [...((slices.medicines || []) as Medicine[])].sort((a, b) => a.name.localeCompare(b.name));
   const medicines = cutoffs?.medicinesClearedAt
-    ? allMedicines.filter((m) => Boolean(m.createdAt && m.createdAt > cutoffs.medicinesClearedAt!))
+    ? allMedicines.filter((m) => (m.createdAt ? m.createdAt > cutoffs.medicinesClearedAt! : true))
     : allMedicines;
 
   const allGrns = sortByDateDesc((slices.grns || []) as GRN[]);

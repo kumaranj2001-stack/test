@@ -288,11 +288,39 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Inventory Medicine List Endpoint
-  if (req.method === "GET" && (url.pathname === "/api/inventory/medicines" || url.pathname === "/api/medicines")) {
+  // Inventory Medicine List & Search Indexing Endpoint
+  if (req.method === "GET" && (url.pathname === "/api/inventory/medicines" || url.pathname === "/api/medicines" || url.pathname === "/api/inventory/search")) {
     try {
       const snap = await getDocs(collection(db, COLLECTIONS.medicines));
-      const firestoreDocs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      let firestoreDocs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+      // Check cloud cutoff if any
+      try {
+        const metaSnap = await getDoc(doc(db, COLLECTIONS.meta, "app"));
+        const cutoff = metaSnap.exists() ? metaSnap.data()?.medicinesClearedAt : null;
+        if (cutoff) {
+          firestoreDocs = firestoreDocs.filter((m) => Boolean(m.createdAt && m.createdAt > cutoff));
+        }
+      } catch {}
+
+      const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+      if (q) {
+        firestoreDocs = firestoreDocs.filter((m) =>
+          (m.name && String(m.name).toLowerCase().includes(q)) ||
+          (m.batch && String(m.batch).toLowerCase().includes(q)) ||
+          (m.supplier && String(m.supplier).toLowerCase().includes(q))
+        );
+      }
+
+      const sup = (url.searchParams.get("supplier") || "").trim().toLowerCase();
+      if (sup) {
+        firestoreDocs = firestoreDocs.filter((m) =>
+          m.supplier && String(m.supplier).toLowerCase().includes(sup)
+        );
+      }
+
+      firestoreDocs.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+
       return sendJson(res, 200, {
         success: true,
         source: "firestore",
@@ -368,11 +396,13 @@ const server = http.createServer(async (req, res) => {
         const id = payload.id || urlId;
         const role = payload.role || req.headers["x-user-role"] || "";
         let { patch, medicines = [] } = payload;
-        if (!medicines || medicines.length === 0) {
+        if (!Array.isArray(medicines) || medicines.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.medicines));
             medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!medicines.some((m) => m && m.id === id)) {
           try {
@@ -380,7 +410,9 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               medicines.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         const result = updateMedicine(id, patch || payload, medicines, role);
 
@@ -422,11 +454,13 @@ const server = http.createServer(async (req, res) => {
         const role = payload.role || req.headers["x-user-role"] || "";
         const minStock = payload.minStock;
         let medicines = payload.medicines || [];
-        if (!medicines || medicines.length === 0) {
+        if (!Array.isArray(medicines) || medicines.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.medicines));
             medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!medicines.some((m) => m && m.id === id)) {
           try {
@@ -434,7 +468,9 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               medicines.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
 
         const result = updateMedicineMinStock(id, minStock, role, medicines);
@@ -522,11 +558,13 @@ const server = http.createServer(async (req, res) => {
         const urlId = (url.pathname.includes("/delete")) ? null : pathParts[pathParts.length - 1];
         const id = payload.id || urlId;
         let { medicines = [] } = payload;
-        if (!medicines || medicines.length === 0) {
+        if (!Array.isArray(medicines) || medicines.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.medicines));
             medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!medicines.some((m) => m && m.id === id)) {
           try {
@@ -534,15 +572,11 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               medicines.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
-
-        let result;
-        if (medicines.some((m) => m && m.id === id)) {
-          result = deleteMedicine(id, medicines);
-        } else {
-          result = { success: true, id, medicines: [] };
-        }
+        const result = deleteMedicine(id, medicines);
 
         // Delete from Firestore gp_medicines
         try {
@@ -622,12 +656,21 @@ const server = http.createServer(async (req, res) => {
       if (body.length > 10 * 1024 * 1024) req.destroy();
     });
 
-    req.on("end", () => {
+    req.on("end", async () => {
       try {
         if (!body) return sendJson(res, 400, { success: false, error: "Empty request body" });
         const payload = JSON.parse(body);
         const role = payload.role || req.headers["x-user-role"] || "";
-        const { grns = [], search = "", startDate, endDate } = payload;
+        let { grns = [], search = "", startDate, endDate } = payload;
+
+        if (!Array.isArray(grns) || grns.length === 0) {
+          try {
+            const snap = await getDocs(collection(db, COLLECTIONS.grns));
+            grns = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          } catch {
+            // fallback
+          }
+        }
 
         const filtered = listApprovedGrns(grns, { search, startDate, endDate }, role);
 
@@ -658,18 +701,18 @@ const server = http.createServer(async (req, res) => {
         const urlId = url.pathname.startsWith("/api/grn/approved/") && url.pathname !== "/api/grn/approved/update"
           ? url.pathname.replace("/api/grn/approved/", "")
           : null;
-        const grnId = payload.grnId || urlId;
+        const grnId = payload.grnId || (payload.grn && payload.grn.id) || urlId;
         const role = payload.role || req.headers["x-user-role"] || "";
-        let { patchData, grns = [], medicines = [], adjustStock = true } = payload;
-        if (!patchData && payload.grn) {
-          patchData = payload.grn;
-        }
+        const patchData = payload.grn || payload.patchData || payload;
+        let { grns = [], medicines = [], adjustStock = true } = payload;
 
-        if (!grns || grns.length === 0) {
+        if (!Array.isArray(grns) || grns.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.grns));
             grns = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!grns.some((g) => g && g.id === grnId)) {
           try {
@@ -677,39 +720,45 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               grns.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
-        if (!medicines || medicines.length === 0) {
+
+        if (!Array.isArray(medicines) || medicines.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.medicines));
             medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
 
-        const result = updateApprovedGrn(grnId, patchData || payload, grns, medicines, role, adjustStock);
+        const result = updateApprovedGrn(grnId, patchData, grns, medicines, role, adjustStock);
 
-        // Persist to Firestore gp_grns and gp_medicines
+        // Persist updated GRN to Firestore gp_grns
         try {
-          if (result.grn) {
-            const docData = {};
-            for (const [k, v] of Object.entries(result.grn)) {
-              if (v !== undefined) docData[k] = v;
-            }
-            await setDoc(doc(db, COLLECTIONS.grns, result.grn.id), docData, { merge: true });
+          const grnDocData = {};
+          for (const [k, v] of Object.entries(result.updatedGrn)) {
+            if (v !== undefined) grnDocData[k] = v;
           }
-          if (Array.isArray(result.medicines)) {
-            for (const m of result.medicines) {
-              if (m && m.id) {
-                const medData = {};
-                for (const [k, v] of Object.entries(m)) {
-                  if (v !== undefined) medData[k] = v;
-                }
-                await setDoc(doc(db, COLLECTIONS.medicines, m.id), medData, { merge: true });
+          await setDoc(doc(db, COLLECTIONS.grns, result.updatedGrn.id), grnDocData, { merge: true });
+        } catch (dbErr) {
+          console.warn("[Firebase approved GRN update warning]", dbErr.message);
+        }
+
+        // Persist modified medicine stock levels to Firestore gp_medicines
+        if (adjustStock && result.medicines && Array.isArray(result.medicines)) {
+          try {
+            for (const med of result.medicines) {
+              const orig = medicines.find((m) => m && m.id === med.id);
+              if (orig && orig.stock !== med.stock) {
+                await setDoc(doc(db, COLLECTIONS.medicines, med.id), { stock: med.stock, updatedAt: new Date().toISOString() }, { merge: true });
               }
             }
+          } catch (dbErr) {
+            console.warn("[Firebase approved GRN stock adjustment warning]", dbErr.message);
           }
-        } catch (dbErr) {
-          console.warn("[Firebase approvedGrn update warning]", dbErr.message);
         }
 
         return sendJson(res, 200, result);
@@ -738,11 +787,13 @@ const server = http.createServer(async (req, res) => {
         const role = payload.role || req.headers["x-user-role"] || url.searchParams.get("role") || "";
         let { grns = [], medicines = [], reverseStock = true } = payload;
 
-        if (!grns || grns.length === 0) {
+        if (!Array.isArray(grns) || grns.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.grns));
             grns = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!grns.some((g) => g && g.id === grnId)) {
           try {
@@ -750,41 +801,41 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               grns.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
-        if (!medicines || medicines.length === 0) {
+
+        if (!Array.isArray(medicines) || medicines.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.medicines));
             medicines = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
-        }
-
-        let result;
-        if (grns.some((g) => g && g.id === grnId)) {
-          result = deleteApprovedGrn(grnId, grns, medicines, role, reverseStock);
-        } else {
-          if (!isDeveloperRole(role)) {
-            throw new Error("Access Denied: Only Developer role can delete approved GRN entries.");
+          } catch {
+            // fallback
           }
-          result = { success: true, grnId, medicines };
         }
 
-        // Delete from Firestore gp_grns and update gp_medicines
+        const result = deleteApprovedGrn(grnId, grns, medicines, role, reverseStock);
+
+        // Delete from Firestore gp_grns
         try {
           await deleteDoc(doc(db, COLLECTIONS.grns, grnId));
-          if (Array.isArray(result.medicines)) {
-            for (const m of result.medicines) {
-              if (m && m.id) {
-                const medData = {};
-                for (const [k, v] of Object.entries(m)) {
-                  if (v !== undefined) medData[k] = v;
-                }
-                await setDoc(doc(db, COLLECTIONS.medicines, m.id), medData, { merge: true });
+        } catch (dbErr) {
+          console.warn("[Firebase approved GRN delete warning]", dbErr.message);
+        }
+
+        // Persist reversed medicine stock levels to Firestore gp_medicines
+        if (reverseStock && result.medicines && Array.isArray(result.medicines)) {
+          try {
+            for (const med of result.medicines) {
+              const orig = medicines.find((m) => m && m.id === med.id);
+              if (orig && orig.stock !== med.stock) {
+                await setDoc(doc(db, COLLECTIONS.medicines, med.id), { stock: med.stock, updatedAt: new Date().toISOString() }, { merge: true });
               }
             }
+          } catch (dbErr) {
+            console.warn("[Firebase approved GRN stock reversal warning]", dbErr.message);
           }
-        } catch (dbErr) {
-          console.warn("[Firebase approvedGrn delete warning]", dbErr.message);
         }
 
         return sendJson(res, 200, result);
@@ -903,12 +954,13 @@ const server = http.createServer(async (req, res) => {
           : null;
         const id = payload.id || urlId;
         let { patch, doctors = [] } = payload;
-
-        if (!doctors || doctors.length === 0) {
+        if (!Array.isArray(doctors) || doctors.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.doctors));
             doctors = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!doctors.some((d) => d && d.id === id)) {
           try {
@@ -916,9 +968,10 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               doctors.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
-
         const result = updateDoctor(id, patch || payload, doctors);
 
         // Update in Firestore gp_doctors
@@ -955,12 +1008,13 @@ const server = http.createServer(async (req, res) => {
           : null;
         const id = payload.id || urlId;
         let { doctors = [] } = payload;
-
-        if (!doctors || doctors.length === 0) {
+        if (!Array.isArray(doctors) || doctors.length === 0) {
           try {
             const snap = await getDocs(collection(db, COLLECTIONS.doctors));
             doctors = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
         if (!doctors.some((d) => d && d.id === id)) {
           try {
@@ -968,15 +1022,11 @@ const server = http.createServer(async (req, res) => {
             if (docSnap.exists()) {
               doctors.push({ id: docSnap.id, ...docSnap.data() });
             }
-          } catch {}
+          } catch {
+            // fallback
+          }
         }
-
-        let result;
-        if (doctors.some((d) => d && d.id === id)) {
-          result = deleteDoctor(id, doctors);
-        } else {
-          result = { success: true, id, doctors: [] };
-        }
+        const result = deleteDoctor(id, doctors);
 
         // Delete from Firestore gp_doctors
         try {

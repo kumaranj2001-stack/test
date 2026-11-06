@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect, useRef } from "react";
 import { useStore, uid } from "../store/store";
 import {
   PackagePlus, Trash2, Save, RotateCcw, Search, Plus, Minus, Layers,
@@ -103,6 +103,42 @@ const Purchases: React.FC = () => {
   const [productQuery, setProductQuery] = useState("");
   const [comboOpen, setComboOpen] = useState(false);
   const [editingLineId, setEditingLineId] = useState<string | null>(null);
+  const comboRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (comboRef.current && !comboRef.current.contains(e.target as Node)) {
+        setComboOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // Synchronize inventory medicines with backend
+  useEffect(() => {
+    fetch("/api/inventory/medicines")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (json?.success && Array.isArray(json.medicines) && json.medicines.length > 0) {
+          setData((d) => {
+            const existingMap = new Map((d.medicines || []).map((m) => [m.id, m]));
+            let hasNew = false;
+            json.medicines.forEach((bm: Medicine) => {
+              if (bm && bm.id && !existingMap.has(bm.id)) {
+                existingMap.set(bm.id, bm);
+                hasNew = true;
+              }
+            });
+            if (hasNew) {
+              return { ...d, medicines: Array.from(existingMap.values()) };
+            }
+            return d;
+          });
+        }
+      })
+      .catch(() => {});
+  }, [setData]);
 
   /* product list */
   const [lines, setLines] = useState<Line[]>([]);
@@ -134,21 +170,34 @@ const Purchases: React.FC = () => {
   const [verifiedInvoiceNumber, setVerifiedInvoiceNumber] = useState("");
   const [verifiedDate, setVerifiedDate] = useState("");
 
-  /* Existing medicines from inventory only — distinct by name */
+  /* Existing medicines from inventory only — distinct by normalized name */
   const inventoryMedicines = useMemo(() => {
     const map = new Map<string, Medicine>();
-    data.medicines.forEach((m) => {
+    (data.medicines || []).forEach((m) => {
+      if (!m || !m.name) return;
       const key = m.name.trim().toLowerCase();
-      if (!map.has(key)) map.set(key, m);
+      if (!map.has(key) || (m.stock > 0 && (map.get(key)?.stock ?? 0) <= 0)) {
+        map.set(key, m);
+      }
     });
     return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
   }, [data.medicines]);
 
   const productMatches = useMemo(() => {
-    const q = productQuery.trim().toLowerCase();
-    if (!q) return [];
-    return inventoryMedicines.filter((m) => m.name.toLowerCase().includes(q)).slice(0, 15);
-  }, [productQuery, inventoryMedicines]);
+    const q = (productQuery !== "" ? productQuery : line.name || "").trim().toLowerCase();
+    if (!q) {
+      return inventoryMedicines.slice(0, 10);
+    }
+    const tokens = q.split(/\s+/).filter(Boolean);
+    return inventoryMedicines
+      .filter((m) => {
+        const nameL = m.name.toLowerCase();
+        const batchL = (m.batch || "").toLowerCase();
+        const supL = (m.supplier || "").toLowerCase();
+        return tokens.every((tok) => nameL.includes(tok) || batchL.includes(tok) || supL.includes(tok));
+      })
+      .slice(0, 15);
+  }, [productQuery, line.name, inventoryMedicines]);
 
   /* Handle file upload using OpenRouter Multimodal LLM */
   const onFiles = async (files: FileList | null) => {
@@ -297,14 +346,22 @@ const Purchases: React.FC = () => {
     ]);
   };
 
-  /* Pick medicine from inventory combobox */
+  /* Pick medicine from inventory combobox and trigger necessary input fields */
   const pickProduct = (m: Medicine) => {
-    setLine({
-      ...line,
+    const tax = TAX_OPTIONS.includes(m.gst) ? m.gst : (m.gst || 12);
+    setLine((prev) => ({
+      ...prev,
       name: m.name,
-      taxPct: TAX_OPTIONS.includes(m.gst) ? m.gst : 12,
-    });
-    setProductQuery("");
+      taxPct: tax,
+      uomPerStrip: prev.uomPerStrip !== "" ? prev.uomPerStrip : 10,
+      receivingQty: prev.receivingQty !== "" ? prev.receivingQty : 1,
+      purchasePrice: m.purchasePrice > 0 ? m.purchasePrice : (prev.purchasePrice || ""),
+      mrpUnit: m.sellingPrice > 0 ? m.sellingPrice : (prev.mrpUnit || ""),
+      batch: m.batch ? m.batch : prev.batch,
+      expiry: m.expiry ? m.expiry : prev.expiry,
+      mfgDate: m.mfgDate ? m.mfgDate : prev.mfgDate,
+    }));
+    setProductQuery(m.name);
     setComboOpen(false);
   };
 
@@ -350,12 +407,16 @@ const Purchases: React.FC = () => {
       setLines((ls) => ls.map((x) => (x.id === editingLineId ? { ...line, id: editingLineId } : x)));
       setEditingLineId(null);
       setLine(blankLine());
+      setProductQuery("");
+      setComboOpen(false);
       notify("✓ Line updated in list");
       return;
     }
 
     setLines((ls) => [...ls, { ...line, id: uid("ln") }]);
     setLine(blankLine());
+    setProductQuery("");
+    setComboOpen(false);
     notify("✓ Line added to list");
   };
 
@@ -722,13 +783,13 @@ const Purchases: React.FC = () => {
           </div>
 
           {/* product combobox — inventory medicines */}
-          <div className="relative">
+          <div className="relative" ref={comboRef}>
             <Label>Product Name * (Select from Inventory or type to normalize)</Label>
             <div className="relative">
               <input
                 className={inputCls + " pr-9"}
-                value={line.name || productQuery}
-                placeholder="Type 2+ letters to search inventory medicine..."
+                value={line.name}
+                placeholder="Type or click to search inventory medicine..."
                 onChange={(e) => {
                   const v = e.target.value;
                   setProductQuery(v);
@@ -736,28 +797,47 @@ const Purchases: React.FC = () => {
                   setComboOpen(true);
                 }}
                 onFocus={() => {
-                  if (productQuery.trim()) setComboOpen(true);
+                  setComboOpen(true);
+                }}
+                onClick={() => {
+                  setComboOpen(true);
                 }}
               />
               <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
             </div>
 
-            {comboOpen && productMatches.length > 0 && (
-              <div className="absolute z-30 left-0 right-0 mt-1 max-h-56 overflow-y-auto bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl">
-                {productMatches.map((m) => (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() => pickProduct(m)}
-                    className="w-full text-left px-3 py-2 text-xs hover:bg-sky-50 dark:hover:bg-slate-700 flex items-center justify-between border-b border-slate-100 dark:border-slate-700/50 last:border-0"
-                  >
-                    <div>
-                      <div className="font-semibold text-slate-800 dark:text-slate-200">{m.name}</div>
-                      <div className="text-[11px] text-slate-400">Current Stock: {m.stock} · GST {m.gst}%</div>
-                    </div>
-                    <Badge tone="blue">Select</Badge>
-                  </button>
-                ))}
+            {comboOpen && (
+              <div
+                className="absolute z-30 left-0 right-0 mt-1 max-h-56 overflow-y-auto bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl"
+                onMouseDown={(e) => e.preventDefault()}
+              >
+                {productMatches.length > 0 ? (
+                  productMatches.map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => pickProduct(m)}
+                      className="w-full text-left px-3 py-2 text-xs hover:bg-sky-50 dark:hover:bg-slate-700 flex items-center justify-between border-b border-slate-100 dark:border-slate-700/50 last:border-0"
+                    >
+                      <div>
+                        <div className="font-semibold text-slate-800 dark:text-slate-200">{m.name}</div>
+                        <div className="text-[11px] text-slate-400">
+                          {m.supplier ? `${m.supplier} · ` : ""}Current Stock: {m.stock} · GST {m.gst}%
+                          {m.purchasePrice > 0 ? ` · Buy: ₹${m.purchasePrice}` : ""}
+                          {m.sellingPrice > 0 ? ` · MRP: ₹${m.sellingPrice}` : ""}
+                        </div>
+                      </div>
+                      <Badge tone="blue">Select</Badge>
+                    </button>
+                  ))
+                ) : (
+                  <div className="px-3 py-2.5 text-xs text-slate-500 dark:text-slate-400">
+                    No matching inventory items found for &ldquo;{productQuery || line.name}&rdquo;.
+                    <span className="block text-[11px] text-sky-600 dark:text-sky-400 mt-0.5">
+                      You can continue typing to log this as a new product in the GRN.
+                    </span>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1048,6 +1128,7 @@ const Purchases: React.FC = () => {
                             type="button"
                             onClick={() => {
                               setLine({ ...l });
+                              setProductQuery(l.name);
                               setEditingLineId(l.id);
                               document.getElementById("grn-line-editor")?.scrollIntoView({ behavior: "smooth" });
                             }}

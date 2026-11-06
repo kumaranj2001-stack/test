@@ -129,4 +129,28 @@ assert.equal(deleted.medicines.length, 1);
 assert.equal(deleted.medicines[0].id, "m_1");
 console.log("✓ Medicine deleted successfully");
 
+// 5. GRN Mode: Initial master medicine creation without prior stock
+console.log("\n5. Testing master medicine creation with GRN mode (requirePurchaseDetails: false)...");
+const grnModePayload = {
+  name: "Cefixime 200mg",
+  supplier: "Apex Healthcare",
+  stock: 0,
+  purchasePrice: 0,
+  sellingPrice: 0,
+  gst: 12,
+  minStock: 10,
+};
+const grnModeValidation = validateMedicinePayload(grnModePayload, { requirePurchaseDetails: false });
+assert.equal(grnModeValidation.isValid, true);
+assert.equal(grnModeValidation.cleanData.stock, 0);
+assert.equal(grnModeValidation.cleanData.purchasePrice, 0);
+assert.equal(grnModeValidation.cleanData.sellingPrice, 0);
+
+const grnModeCreated = createMedicine(grnModePayload, existingMedicines, { requirePurchaseDetails: false });
+assert.equal(grnModeCreated.success, true);
+assert.equal(grnModeCreated.medicine.name, "Cefixime 200mg");
+assert.equal(grnModeCreated.medicine.stock, 0);
+assert.ok(grnModeCreated.medicine.createdAt, "createdAt timestamp must be set");
+console.log("✓ Master medicine created successfully with 0 initial stock & pricing for GRN intake");
+
 console.log("\nALL MEDICINE HANDLER UNIT TESTS PASSED!");

@@ -220,7 +220,7 @@ export const ApprovedGrn: React.FC = () => {
     fetch(`/api/grn/approved/${updatedGrn.id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", "x-user-role": currentUser?.role || "" },
-      body: JSON.stringify({ grn: updatedGrn, adjustStock: adjustStockOnEdit }),
+      body: JSON.stringify({ grn: updatedGrn, patchData: updatedGrn, adjustStock: adjustStockOnEdit }),
     }).catch(() => {});
     flashToast(`Approved GRN ${updatedGrn.number} updated successfully`);
     setEditDraft(null);

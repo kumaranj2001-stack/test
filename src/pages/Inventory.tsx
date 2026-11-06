@@ -396,6 +396,7 @@ const Inventory: React.FC<InventoryProps> = ({ initialFilter, onConsumeFilter })
     const parsedGst = form.gst === "" ? 0 : Number(form.gst);
     const parsedMinStock = form.minStock === "" ? 10 : Number(form.minStock);
 
+    const nowIso = new Date().toISOString();
     const cleanMedicineData = {
       name: form.name.trim(),
       supplier: form.supplier.trim(),
@@ -408,6 +409,7 @@ const Inventory: React.FC<InventoryProps> = ({ initialFilter, onConsumeFilter })
       gst: parsedGst,
       narcotic: form.narcotic,
       minStock: parsedMinStock,
+      createdAt: edit?.createdAt || nowIso,
     };
 
     if (edit) {
@@ -442,6 +444,7 @@ const Inventory: React.FC<InventoryProps> = ({ initialFilter, onConsumeFilter })
         } else {
           const errJson = await res.json().catch(() => null);
           if (errJson?.error) {
+            console.error("[Backend Medicine Create Error]", errJson.error);
             alert(errJson.error);
             return;
           }
@@ -450,9 +453,9 @@ const Inventory: React.FC<InventoryProps> = ({ initialFilter, onConsumeFilter })
         console.warn("[Backend Medicine Create Warning]", apiErr);
       }
 
-      const nm: Medicine = backendMedicine || { id: uid("m"), ...cleanMedicineData };
-      setData((d) => ({ ...d, medicines: [nm, ...d.medicines] }));
-      log("MEDICINE_CREATE", `${cleanMedicineData.name} (${cleanMedicineData.batch})`);
+      const nm: Medicine = backendMedicine || { id: uid("m"), ...cleanMedicineData, createdAt: nowIso };
+      setData((d) => ({ ...d, medicines: [nm, ...d.medicines.filter((x) => x.id !== nm.id)] }));
+      log("MEDICINE_CREATE", `${cleanMedicineData.name} (${cleanMedicineData.batch || "GRN Pending"})`);
       flashToast(`Medicine "${cleanMedicineData.name}" added to inventory`, "ok");
     }
     setOpen(false);
